@@ -17,32 +17,11 @@ import (
 
 // CLI user errors.
 var (
-	errFlagRequired       = errors.New("--name or --identifier flag is required")
+	errFlagRequired       = errors.New("--username or --identifier flag is required")
 	errMultipleUsersMatch = errors.New("multiple users match query, specify an ID")
 )
 
-func usernameAndIDFlag(cmd *cobra.Command) {
-	cmd.Flags().Int64P("identifier", "i", -1, "User identifier (ID)")
-	cmd.Flags().StringP("name", "n", "", "Username")
-}
 
-// usernameAndIDFromFlag returns the username and ID from the flags of the command.
-func usernameAndIDFromFlag(cmd *cobra.Command) (uint64, string, error) {
-	username, _ := cmd.Flags().GetString("name")
-
-	identifier, _ := cmd.Flags().GetInt64("identifier")
-	if username == "" && identifier < 0 {
-		return 0, "", errFlagRequired
-	}
-
-	// Normalise unset/negative identifiers to 0 so the uint64
-	// conversion does not produce a bogus large value.
-	if identifier < 0 {
-		identifier = 0
-	}
-
-	return uint64(identifier), username, nil //nolint:gosec // identifier is clamped to >= 0 above
-}
 
 func init() {
 	rootCmd.AddCommand(userCmd)
@@ -52,13 +31,11 @@ func init() {
 	createUserCmd.Flags().StringP("picture-url", "p", "", "Profile picture URL")
 	userCmd.AddCommand(listUsersCmd)
 	usernameAndIDFlag(listUsersCmd)
-	listUsersCmd.Flags().StringP("email", "e", "", "Email")
+	listUsersCmd.Flags().StringP("email", "e", "", "email")
 	userCmd.AddCommand(destroyUserCmd)
 	usernameAndIDFlag(destroyUserCmd)
 	userCmd.AddCommand(renameUserCmd)
-	usernameAndIDFlag(renameUserCmd)
-	renameUserCmd.Flags().StringP("new-name", "r", "", "New username")
-	mustMarkRequired(renameUserCmd, "new-name")
+	renameUserCmd.Flags().Int64P("identifier", "i", -1, "User identifier (ID)")
 }
 
 var userCmd = &cobra.Command{
@@ -113,7 +90,7 @@ var createUserCmd = &cobra.Command{
 }
 
 var destroyUserCmd = &cobra.Command{
-	Use:     "destroy --identifier ID or --name NAME",
+	Use:     "destroy --identifier ID or --username USERNAME",
 	Short:   "Destroys a user",
 	Aliases: []string{"delete"},
 	RunE: grpcRunE(func(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, args []string) error {
@@ -203,17 +180,44 @@ var listUsersCmd = &cobra.Command{
 }
 
 var renameUserCmd = &cobra.Command{
-	Use:     "rename",
+	Use:     "rename OLD_USERNAME NEW_USERNAME or rename -i ID NEW_USERNAME",
 	Short:   "Renames a user",
 	Aliases: []string{"mv"},
+	Args: func(cmd *cobra.Command, args []string) error {
+		identifier, _ := cmd.Flags().GetInt64("identifier")
+
+		// Either -i flag with one arg, or two positional args
+		if identifier >= 0 {
+			// Using -i flag, need exactly one arg (new name)
+			if len(args) != 1 {
+				return fmt.Errorf("expected NEW_USERNAME argument when using --identifier flag")
+			}
+		} else {
+			// Not using -i flag, need exactly two args (old name and new name)
+			if len(args) != 2 {
+				return fmt.Errorf("expected OLD_USERNAME and NEW_USERNAME as arguments")
+			}
+		}
+
+		return nil
+	},
 	RunE: grpcRunE(func(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, args []string) error {
-		id, username, err := usernameAndIDFromFlag(cmd)
-		if err != nil {
-			return err
+		var id uint64
+		var oldName string
+		var newName string
+
+		identifier, _ := cmd.Flags().GetInt64("identifier")
+
+		if identifier >= 0 {
+			id = uint64(identifier)
+			newName = args[0]
+		} else {
+			oldName = args[0]
+			newName = args[1]
 		}
 
 		listReq := &v1.ListUsersRequest{
-			Name: username,
+			Name: oldName,
 			Id:   id,
 		}
 
@@ -226,10 +230,10 @@ var renameUserCmd = &cobra.Command{
 			return errMultipleUsersMatch
 		}
 
-		newName, _ := cmd.Flags().GetString("new-name")
+		user := users.GetUsers()[0]
 
 		renameReq := &v1.RenameUserRequest{
-			OldId:   id,
+			OldId:   user.GetId(),
 			NewName: newName,
 		}
 
