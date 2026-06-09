@@ -7,14 +7,15 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/sasha-s/go-deadlock"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/zstdframe"
 )
@@ -33,11 +34,9 @@ type mapSession struct {
 	ctx    context.Context //nolint:containedctx
 	capVer tailcfg.CapabilityVersion
 
-	cancelChMu deadlock.Mutex
-
-	ch           chan *tailcfg.MapResponse
-	cancelCh     chan struct{}
-	cancelChOpen bool
+	ch             chan *tailcfg.MapResponse
+	cancelCh       chan struct{}
+	cancelChClosed atomic.Bool
 
 	keepAlive       time.Duration
 	keepAliveTicker *time.Ticker
@@ -64,9 +63,8 @@ func (h *Headscale) newMapSession(
 		node:   node,
 		capVer: req.Version,
 
-		ch:           make(chan *tailcfg.MapResponse, h.cfg.Tuning.NodeMapSessionBufferedChanSize),
-		cancelCh:     make(chan struct{}),
-		cancelChOpen: true,
+		ch:       make(chan *tailcfg.MapResponse, h.cfg.Tuning.NodeMapSessionBufferedChanSize),
+		cancelCh: make(chan struct{}),
 
 		keepAlive:       ka,
 		keepAliveTicker: nil,
@@ -92,6 +90,12 @@ func (m *mapSession) resetKeepAlive() {
 	m.keepAliveTicker.Reset(m.keepAlive)
 }
 
+func (m *mapSession) stopFromBatcher() {
+	if m.cancelChClosed.CompareAndSwap(false, true) {
+		close(m.cancelCh)
+	}
+}
+
 func (m *mapSession) beforeServeLongPoll() {
 	if m.node.IsEphemeral() {
 		m.h.ephemeralGC.Cancel(m.node.ID)
@@ -102,7 +106,7 @@ func (m *mapSession) beforeServeLongPoll() {
 // is disconnected.
 func (m *mapSession) afterServeLongPoll() {
 	if m.node.IsEphemeral() {
-		m.h.ephemeralGC.Schedule(m.node.ID, m.h.cfg.EphemeralNodeInactivityTimeout)
+		m.h.ephemeralGC.Schedule(m.node.ID, m.h.cfg.Node.Ephemeral.InactivityTimeout)
 	}
 }
 
@@ -111,7 +115,7 @@ func (m *mapSession) serve() {
 	// This is the mechanism where the node gives us information about its
 	// current configuration.
 	//
-	// Process the MapRequest to update node state (endpoints, hostinfo, etc.)
+	// Process the [tailcfg.MapRequest] to update node state (endpoints, hostinfo, etc.)
 	c, err := m.h.state.UpdateNodeFromMapRequest(m.node.ID, m.req)
 	if err != nil {
 		httpError(m.w, err)
@@ -144,18 +148,28 @@ func (m *mapSession) serveLongPoll() {
 
 	m.log.Trace().Caller().Msg("long poll session started")
 
+	// connectGen is set by [state.State.Connect] below and captured by the deferred cleanup closure.
+	// It allows [state.State.Disconnect] to reject stale calls from old sessions — if a newer session
+	// has called [state.State.Connect] (incrementing the generation), the old session's [state.State.Disconnect]
+	// sees a mismatched generation and becomes a no-op.
+	var connectGen uint64
+
 	// Clean up the session when the client disconnects
 	defer func() {
-		m.cancelChMu.Lock()
-		m.cancelChOpen = false
-		close(m.cancelCh)
-		m.cancelChMu.Unlock()
+		m.stopFromBatcher()
 
-		_ = m.h.mapBatcher.RemoveNode(m.node.ID, m.ch)
+		stillConnected := m.h.mapBatcher.RemoveNode(m.node.ID, m.ch)
+
+		// If another session already exists for this node (reconnect
+		// happened before this cleanup ran), skip the grace period
+		// entirely — the node is not actually disconnecting.
+		if stillConnected {
+			return
+		}
 
 		// When a node disconnects, it might rapidly reconnect (e.g. mobile clients, network weather).
 		// Instead of immediately marking the node as offline, we wait a few seconds to see if it reconnects.
-		// If it does reconnect, the existing mapSession will be replaced and the node remains online.
+		// If it does reconnect, the existing [mapSession] will be replaced and the node remains online.
 		// If it doesn't reconnect within the timeout, we mark it as offline.
 		//
 		// This avoids flapping nodes in the UI and unnecessary churn in the network.
@@ -176,7 +190,11 @@ func (m *mapSession) serveLongPoll() {
 		}
 
 		if disconnected {
-			disconnectChanges, err := m.h.state.Disconnect(m.node.ID)
+			// Pass the generation from our [state.State.Connect] call. If a newer session has
+			// connected since (bumping the generation), [state.State.Disconnect] will detect
+			// the mismatch and skip the state update, preventing the race where
+			// an old grace period goroutine overwrites a newer session's online status.
+			disconnectChanges, err := m.h.state.Disconnect(m.node.ID, connectGen)
 			if err != nil {
 				m.log.Error().Caller().Err(err).Msg("failed to disconnect node")
 			}
@@ -196,12 +214,12 @@ func (m *mapSession) serveLongPoll() {
 
 	m.keepAliveTicker = time.NewTicker(m.keepAlive)
 
-	// Process the initial MapRequest to update node state (endpoints, hostinfo, etc.)
-	// This must be done BEFORE calling Connect() to ensure routes are properly synchronized.
-	// When nodes reconnect, they send their hostinfo with announced routes in the MapRequest.
-	// We need this data in NodeStore before Connect() sets up the primary routes, because
-	// SubnetRoutes() calculates the intersection of announced and approved routes. If we
-	// call Connect() first, SubnetRoutes() returns empty (no announced routes yet), causing
+	// Process the initial [tailcfg.MapRequest] to update node state (endpoints, hostinfo, etc.)
+	// This must be done BEFORE calling [state.State.Connect] to ensure routes are properly synchronized.
+	// When nodes reconnect, they send their hostinfo with announced routes in the [tailcfg.MapRequest].
+	// We need this data in [state.NodeStore] before [state.State.Connect] sets up the primary routes, because
+	// [types.NodeView.SubnetRoutes] calculates the intersection of announced and approved routes. If we
+	// call [state.State.Connect] first, [types.NodeView.SubnetRoutes] returns empty (no announced routes yet), causing
 	// the node to be incorrectly removed from AvailableRoutes.
 	mapReqChange, err := m.h.state.UpdateNodeFromMapRequest(m.node.ID, m.req)
 	if err != nil {
@@ -211,11 +229,13 @@ func (m *mapSession) serveLongPoll() {
 
 	// Connect the node after its state has been updated.
 	// We send two separate change notifications because these are distinct operations:
-	// 1. UpdateNodeFromMapRequest: processes the client's reported state (routes, endpoints, hostinfo)
-	// 2. Connect: marks the node online and recalculates primary routes based on the updated state
+	// 1. [state.State.UpdateNodeFromMapRequest]: processes the client's reported state (routes, endpoints, hostinfo)
+	// 2. [state.State.Connect]: marks the node online and recalculates primary routes based on the updated state
 	// While this results in two notifications, it ensures route data is synchronized before
 	// primary route selection occurs, which is critical for proper HA subnet router failover.
-	connectChanges := m.h.state.Connect(m.node.ID)
+	var connectChanges []change.Change
+
+	connectChanges, connectGen = m.h.state.Connect(m.node.ID)
 
 	m.log.Info().Caller().Str(zf.Chan, fmt.Sprintf("%p", m.ch)).Msg("node has connected")
 
@@ -224,7 +244,7 @@ func (m *mapSession) serveLongPoll() {
 	// adding this before connecting it to the state ensure that
 	// it does not miss any updates that might be sent in the split
 	// time between the node connecting and the batcher being ready.
-	if err := m.h.mapBatcher.AddNode(m.node.ID, m.ch, m.capVer); err != nil { //nolint:noinlineerr
+	if err := m.h.mapBatcher.AddNode(m.node.ID, m.ch, m.capVer, m.stopFromBatcher); err != nil { //nolint:noinlineerr
 		m.log.Error().Caller().Err(err).Msg("failed to add node to batcher")
 		return
 	}
@@ -288,8 +308,8 @@ func (m *mapSession) serveLongPoll() {
 
 // writeMap writes the map response to the client.
 // It handles compression if requested and any headers that need to be set.
-// It also handles flushing the response if the ResponseWriter
-// implements http.Flusher.
+// It also handles flushing the response if the [http.ResponseWriter]
+// implements [http.Flusher].
 func (m *mapSession) writeMap(msg *tailcfg.MapResponse) error {
 	jsonBody, err := json.Marshal(msg)
 	if err != nil {

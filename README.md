@@ -30,8 +30,8 @@ nodes in the Tailscale network. It assigns the IP addresses of the clients,
 creates the boundaries between each user, enables sharing machines between users,
 and exposes the advertised routes of your nodes.
 
-A [Tailscale network (tailnet)](https://tailscale.com/kb/1136/tailnet/) is private
-network which Tailscale assigns to a user in terms of private users or an
+A [Tailscale network (tailnet)](https://tailscale.com/docs/concepts/tailnet) is
+private network which Tailscale assigns to a user in terms of private users or an
 organisation.
 
 ## Design goal
@@ -64,6 +64,12 @@ and container to run Headscale.**
 Please have a look at the [`documentation`](https://headscale.net/stable/).
 
 For NixOS users, a module is available in [`nix/`](./nix/).
+
+## Builds from `main`
+
+Development builds from the `main` branch are available as container images and
+binaries. See the [development builds](https://headscale.net/stable/setup/install/main/)
+documentation for details.
 
 ## Talks
 

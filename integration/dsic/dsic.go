@@ -40,6 +40,7 @@ type DERPServerInContainer struct {
 	stunPort            int
 	derpPort            int
 	caCerts             [][]byte
+	tlsCACert           []byte
 	tlsCert             []byte
 	tlsKey              []byte
 	withExtraHosts      []string
@@ -135,7 +136,7 @@ func (dsic *DERPServerInContainer) buildEntrypoint(derperArgs string) []string {
 	return []string{"/bin/sh", "-c", strings.Join(commands, " ; ")}
 }
 
-// New returns a new TailscaleInContainer instance.
+// New returns a new [tsic.TailscaleInContainer] instance.
 func New(
 	pool *dockertest.Pool,
 	version string,
@@ -160,21 +161,26 @@ func New(
 		hostname = fmt.Sprintf("derp-%s-%s", strings.ReplaceAll(version, ".", "-"), hash)
 	}
 
-	tlsCert, tlsKey, err := integrationutil.CreateCertificate(hostname)
+	tlsCACert, tlsCert, tlsKey, err := integrationutil.CreateCertificate(hostname)
 	if err != nil {
-		return nil, fmt.Errorf("creating certificates for headscale test: %w", err)
+		return nil, fmt.Errorf("creating certificates for derp test: %w", err)
 	}
 
 	dsic := &DERPServerInContainer{
-		version:  version,
-		hostname: hostname,
-		pool:     pool,
-		networks: networks,
-		tlsCert:  tlsCert,
-		tlsKey:   tlsKey,
-		stunPort: 3478, //nolint
-		derpPort: 443,  //nolint
+		version:   version,
+		hostname:  hostname,
+		pool:      pool,
+		networks:  networks,
+		tlsCACert: tlsCACert,
+		tlsCert:   tlsCert,
+		tlsKey:    tlsKey,
+		stunPort:  3478, //nolint
+		derpPort:  443,  //nolint
 	}
+
+	// Install the CA cert so the DERP server trusts its own certificate
+	// and any headscale CA certs passed via [WithCACert].
+	dsic.caCerts = append(dsic.caCerts, tlsCACert)
 
 	for _, opt := range opts {
 		opt(dsic)
@@ -297,9 +303,10 @@ func (t *DERPServerInContainer) Shutdown() error {
 	return t.pool.Purge(t.container)
 }
 
-// GetCert returns the TLS certificate of the DERPer instance.
+// GetCert returns the CA certificate that clients should trust to
+// verify this DERP server's TLS certificate.
 func (t *DERPServerInContainer) GetCert() []byte {
-	return t.tlsCert
+	return t.tlsCACert
 }
 
 // Hostname returns the hostname of the DERPer instance.
@@ -312,7 +319,7 @@ func (t *DERPServerInContainer) Version() string {
 	return t.version
 }
 
-// ID returns the Docker container ID of the DERPServerInContainer
+// ID returns the Docker container ID of the [DERPServerInContainer]
 // instance.
 func (t *DERPServerInContainer) ID() string {
 	return t.container.Container.ID

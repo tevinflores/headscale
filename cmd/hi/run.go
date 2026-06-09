@@ -76,7 +76,7 @@ func detectGoVersion() string {
 
 	content, err := os.ReadFile(goModPath)
 	if err != nil {
-		return "1.26.0"
+		return "1.26.1"
 	}
 
 	lines := splitLines(string(content))
@@ -91,10 +91,10 @@ func detectGoVersion() string {
 		}
 	}
 
-	return "1.26.0"
+	return "1.26.1"
 }
 
-// splitLines splits a string into lines without using strings.Split.
+// splitLines splits a string into lines without using [strings.Split].
 func splitLines(s string) []string {
 	var (
 		lines   []string
