@@ -42,7 +42,7 @@ var preauthkeysCmd = &cobra.Command{
 	Aliases: []string{"preauthkey", "authkey", "pre"},
 }
 
-var listPreAuthKeys = &cobra.Command{
+var listPreAuthKeysCmd = &cobra.Command{
 	Use:     cmdList,
 	Short:   "List all preauthkeys",
 	Aliases: []string{"ls", cmdShow},
